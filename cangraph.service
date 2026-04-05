@@ -1,0 +1,15 @@
+[Unit]
+Description=CanGraph MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cangraph
+ExecStart=/usr/bin/python3 -m uvicorn server:app --host 0.0.0.0 --port 8002
+Restart=always
+RestartSec=5
+Environment=CANGRAPH_DB=/opt/cangraph/canada_b2b.db
+
+[Install]
+WantedBy=multi-user.target

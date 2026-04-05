@@ -1,0 +1,4 @@
+cangraph.ca {
+    reverse_proxy localhost:8002
+    encode gzip
+}
