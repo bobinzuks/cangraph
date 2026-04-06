@@ -64,11 +64,12 @@ class RateLimiter:
 
 
 # --- HTTP -------------------------------------------------------------------
-def http_get(url: str, timeout: int = 30) -> bytes | None:
+def http_get(url: str, timeout: int = 10) -> bytes | None:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
+            # Cap read to 200KB to avoid slow transfers
+            return r.read(200_000)
     except Exception:
         return None
 
@@ -86,7 +87,7 @@ def query_cdx(domain: str, limiter: RateLimiter, max_snapshots: int = 3) -> list
     }
     url = f"{CDX_API}?{urllib.parse.urlencode(params)}"
     limiter.wait()
-    raw = http_get(url, timeout=20)
+    raw = http_get(url, timeout=10)
     if not raw:
         return []
     try:
@@ -114,7 +115,7 @@ def query_cdx(domain: str, limiter: RateLimiter, max_snapshots: int = 3) -> list
 def fetch_snapshot(timestamp: str, original: str, limiter: RateLimiter) -> str | None:
     url = f"{WAYBACK_BASE}/{timestamp}id_/{original}"  # id_ = raw, no wayback toolbar
     limiter.wait()
-    raw = http_get(url, timeout=30)
+    raw = http_get(url, timeout=10)
     if not raw:
         return None
     try:

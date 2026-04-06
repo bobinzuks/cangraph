@@ -138,7 +138,7 @@ jobs:
           conn.close()
           PY
 
-      - name: Run harvester
+      - name: Run harvester (SONA-fast)
         if: steps.check.outputs.skip == 'false'
         env:
           CANGRAPH_DIR: "."
@@ -147,10 +147,10 @@ jobs:
           python3 scripts/wayback_harvest.py \
             --db data/harvest.db \
             --limit 999999 \
-            --workers 4 \
-            --rate 3 \
-            --max-snapshots 2
-        timeout-minutes: 50
+            --workers 8 \
+            --rate 12 \
+            --max-snapshots 1
+        timeout-minutes: 40
 
       - name: Export results
         if: steps.check.outputs.skip == 'false'
