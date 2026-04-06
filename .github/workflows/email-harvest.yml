@@ -1,0 +1,270 @@
+name: Email Harvest (Web Scrape)
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_domains:
+        description: "Total domains to harvest"
+        required: false
+        default: "50000"
+      shards:
+        description: "Parallel workers"
+        required: false
+        default: "20"
+
+permissions:
+  contents: write
+
+jobs:
+  prep:
+    name: Fetch domains
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      count: ${{ steps.fetch.outputs.count }}
+
+    steps:
+      - name: Install sshpass
+        run: sudo apt-get install -y sshpass
+
+      - name: Fetch with SONA retry
+        id: fetch
+        env:
+          VPS_PASS: ${{ secrets.VPS_PASS }}
+        run: |
+          LIMIT=${{ github.event.inputs.total_domains || '50000' }}
+          SHARDS=${{ github.event.inputs.shards || '20' }}
+          mkdir -p data
+
+          DELAY=5
+          for attempt in 1 2 3 4 5 6 7 8; do
+            echo "Attempt $attempt..."
+            if sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
+              root@147.93.113.37 \
+              "sqlite3 /opt/cangraph/canada_b2b.db \"SELECT domain FROM businesses WHERE domain IS NOT NULL AND domain != '' AND domain LIKE '%.%' AND length(domain) > 4 AND (email IS NULL OR email = '') ORDER BY confidence DESC LIMIT $LIMIT;\"" \
+              > data/domains.txt 2>/dev/null; then
+              echo "OK on attempt $attempt"
+              break
+            fi
+            sleep $DELAY
+            DELAY=$((DELAY * 2))
+          done
+
+          COUNT=$(wc -l < data/domains.txt)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Fetched $COUNT domains"
+
+          SHARD_SIZE=$(( (COUNT + SHARDS - 1) / SHARDS ))
+          split -l $SHARD_SIZE -d -a 2 data/domains.txt data/shard_
+
+      - name: Upload shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-shards
+          path: data/shard_*
+          retention-days: 1
+
+  harvest:
+    name: "Harvest ${{ matrix.shard }}"
+    needs: prep
+    if: needs.prep.outputs.count > 0
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ["00","01","02","03","04","05","06","07","08","09","10","11","12","13","14","15","16","17","18","19"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Download shard
+        uses: actions/download-artifact@v4
+        with:
+          name: email-shards
+          path: data
+
+      - name: Check shard
+        id: check
+        run: |
+          F="data/shard_${{ matrix.shard }}"
+          if [ -f "$F" ] && [ -s "$F" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "$(wc -l < $F) domains"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Harvest emails from websites
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          python3 << 'PYSCRIPT'
+          import json, os, random, re, sys, time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import requests
+
+          UA = [
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+              "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+          ]
+
+          PATHS = ["/contact", "/contact-us", "/about", "/about-us", "/"]
+          EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+          PHONE_RE = re.compile(r'(?:\+?1[\s.-]?)?(?:\(?[2-9]\d{2}\)?[\s.-]?)[2-9]\d{2}[\s.-]?\d{4}')
+          JUNK = {"example.com","wixpress.com","wordpress.com","squarespace.com","shopify.com",
+                  "googleapis.com","w3.org","schema.org","gravatar.com","google.com","facebook.com",
+                  "twitter.com","youtube.com","jquery.com","bootstrap.com","sentry.io","godaddy.com"}
+
+          shard = "${{ matrix.shard }}"
+          domains = [d.strip() for d in Path(f"data/shard_{shard}").read_text().splitlines() if d.strip()]
+          print(f"Processing {len(domains)} domains", flush=True)
+
+          results = []
+
+          def harvest(domain):
+              s = requests.Session()
+              s.headers["User-Agent"] = random.choice(UA)
+              emails, phones = set(), set()
+              for path in PATHS:
+                  try:
+                      r = s.get(f"https://{domain}{path}", timeout=8, allow_redirects=True)
+                      if r.status_code == 200 and "text/html" in r.headers.get("content-type", ""):
+                          html = r.text[:80000]
+                          for m in EMAIL_RE.finditer(html):
+                              e = m.group(0).lower().rstrip(".")
+                              d_part = e.split("@")[1] if "@" in e else ""
+                              if d_part not in JUNK and not e.startswith(("noreply","no-reply")):
+                                  emails.add(e)
+                          for m in PHONE_RE.finditer(html):
+                              p = re.sub(r'[\s.()\-]', '', m.group(0))
+                              if p.startswith("+1"): p = p[2:]
+                              elif p.startswith("1") and len(p) == 11: p = p[1:]
+                              if len(p) == 10: phones.add(p)
+                          if emails: break  # Got emails, stop checking paths
+                  except: pass
+              return domain, list(emails), list(phones)
+
+          with ThreadPoolExecutor(max_workers=30) as pool:
+              futs = {pool.submit(harvest, d): d for d in domains}
+              done = 0
+              for f in as_completed(futs):
+                  done += 1
+                  try:
+                      domain, emails, phones = f.result()
+                      if emails or phones:
+                          results.append({"domain": domain, "emails": emails, "phones": phones})
+                  except: pass
+                  if done % 200 == 0:
+                      print(f"  {done}/{len(domains)}, {len(results)} with data", flush=True)
+
+          out = Path(f"data/emails_{shard}.jsonl")
+          with out.open("w") as fp:
+              for r in results:
+                  fp.write(json.dumps(r) + "\n")
+          print(f"Done: {len(domains)} crawled, {len(results)} with emails/phones")
+          PYSCRIPT
+        timeout-minutes: 50
+
+      - name: Upload results
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emails-${{ matrix.shard }}
+          path: data/emails_*.jsonl
+          retention-days: 30
+
+  merge:
+    name: Merge & push
+    needs: harvest
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+          pattern: "emails-*"
+          merge-multiple: true
+
+      - name: Merge and stats
+        run: |
+          mkdir -p data
+          cat results/*.jsonl > data/all_emails.jsonl 2>/dev/null || true
+          if [ -f data/all_emails.jsonl ]; then
+            TOTAL=$(wc -l < data/all_emails.jsonl)
+            echo "Domains with contacts: $TOTAL"
+            python3 -c "
+          import json
+          emails, phones = 0, 0
+          with open('data/all_emails.jsonl') as f:
+            for l in f:
+              r = json.loads(l)
+              emails += len(r.get('emails',[]))
+              phones += len(r.get('phones',[]))
+          print(f'Emails: {emails}, Phones: {phones}')
+          "
+          fi
+
+      - name: Push to VPS with SONA retry
+        env:
+          VPS_PASS: ${{ secrets.VPS_PASS }}
+        run: |
+          if [ ! -f data/all_emails.jsonl ] || [ ! -s data/all_emails.jsonl ]; then exit 0; fi
+          sudo apt-get install -y sshpass
+
+          DELAY=5
+          for attempt in 1 2 3 4 5 6 7 8; do
+            echo "Push attempt $attempt..."
+            if sshpass -p "$VPS_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
+              data/all_emails.jsonl root@147.93.113.37:/opt/cangraph/data/ && \
+              sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
+              root@147.93.113.37 "python3 -c \"
+          import json, sqlite3
+          conn = sqlite3.connect('/opt/cangraph/canada_b2b.db')
+          conn.execute('PRAGMA journal_mode=WAL')
+          conn.execute('CREATE TABLE IF NOT EXISTS harvested_emails (id INTEGER PRIMARY KEY AUTOINCREMENT, business_id INTEGER, domain TEXT, email TEXT, phone TEXT, source_page TEXT, is_primary INTEGER DEFAULT 0, harvested_at TEXT, UNIQUE(domain, email))')
+          added = 0
+          with open('/opt/cangraph/data/all_emails.jsonl') as f:
+            for line in f:
+              r = json.loads(line)
+              d = r['domain']
+              for e in r.get('emails',[]):
+                try:
+                  conn.execute('INSERT OR IGNORE INTO harvested_emails (domain, email) VALUES (?,?)', (d, e))
+                  added += 1
+                except: pass
+              for p in r.get('phones',[]):
+                try:
+                  conn.execute('INSERT OR IGNORE INTO harvested_emails (domain, phone) VALUES (?,?)', (d, p))
+                  added += 1
+                except: pass
+              if r.get('emails'):
+                conn.execute('UPDATE businesses SET email=? WHERE domain=? AND (email IS NULL OR email=\\\"\\\")', (r['emails'][0], d))
+          conn.commit()
+          print(f'Imported {added} contacts')
+          conn.close()
+          \""; then
+              echo "Push succeeded"
+              break
+            fi
+            echo "Failed, backing off ${DELAY}s"
+            sleep $DELAY
+            DELAY=$((DELAY * 2))
+          done
