@@ -209,37 +209,16 @@ jobs:
             exit 0
           fi
           sudo apt-get install -y sshpass
+
           DELAY=5
           for attempt in 1 2 3 4 5 6 7 8; do
             echo "Push attempt $attempt..."
             if sshpass -p "$VPS_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
-              data/wayback_merged.jsonl root@147.93.113.37:/opt/cangraph/data/ 2>/dev/null; then
-
+              data/wayback_merged.jsonl root@147.93.113.37:/opt/cangraph/data/ && \
+              sshpass -p "$VPS_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
+              scripts/import_wayback.py root@147.93.113.37:/opt/cangraph/data/ && \
               sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
-                root@147.93.113.37 << 'REMOTE'
-              python3 << 'PY'
-              import json, sqlite3
-              conn = sqlite3.connect("/opt/cangraph/canada_b2b.db")
-              conn.execute("PRAGMA journal_mode=WAL")
-              conn.execute("""CREATE TABLE IF NOT EXISTS wayback_contacts (
-                id INTEGER PRIMARY KEY, business_id INTEGER, domain TEXT,
-                email TEXT, phone TEXT, snapshot_url TEXT, snapshot_date TEXT,
-                extracted_at TEXT DEFAULT (datetime('now'))
-              )""")
-              count = 0
-              with open("/opt/cangraph/data/wayback_merged.jsonl") as f:
-                for line in f:
-                  r = json.loads(line)
-                  try:
-                    conn.execute("INSERT OR IGNORE INTO wayback_contacts (domain, email, phone, extracted_at) VALUES (?,?,?,?)",
-                      (r.get("domain"), r.get("email"), r.get("phone"), r.get("ts")))
-                    count += 1
-                  except: pass
-              conn.commit()
-              print(f"Imported {count} wayback contacts")
-              conn.close()
-              PY
-              REMOTE
+              root@147.93.113.37 "python3 /opt/cangraph/data/import_wayback.py /opt/cangraph/canada_b2b.db /opt/cangraph/data/wayback_merged.jsonl"; then
               echo "Push succeeded"
               break
             fi

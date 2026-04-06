@@ -263,35 +263,11 @@ jobs:
           for attempt in 1 2 3 4 5 6 7 8; do
             echo "Push attempt $attempt..."
             if sshpass -p "$VPS_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
-              data/all_trackers.jsonl root@147.93.113.37:/opt/cangraph/data/ 2>/dev/null; then
-
+              data/all_trackers.jsonl root@147.93.113.37:/opt/cangraph/data/ && \
+              sshpass -p "$VPS_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
+              scripts/import_trackers.py root@147.93.113.37:/opt/cangraph/data/ && \
               sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 \
-                root@147.93.113.37 << 'REMOTE'
-              python3 << 'PY'
-              import json, sqlite3
-              conn = sqlite3.connect("/opt/cangraph/master_web_map.db")
-              conn.execute("PRAGMA journal_mode=WAL")
-              added = 0
-              with open("/opt/cangraph/data/all_trackers.jsonl") as f:
-                for line in f:
-                  r = json.loads(line)
-                  domain = r["domain"]
-                  for ttype, ids in r.get("ids", {}).items():
-                    for tid in ids:
-                      full_id = f"{ttype}:{tid}"
-                      try:
-                        conn.execute("INSERT OR IGNORE INTO tracking_ids (type, id) VALUES (?, ?)", (ttype, full_id))
-                        row = conn.execute("SELECT id FROM tracking_ids WHERE type=? AND id=?", (ttype, full_id)).fetchone()
-                        if row:
-                          conn.execute("INSERT OR IGNORE INTO domain_ids (domain, tracking_id) VALUES (?, ?)", (domain, row[0]))
-                          added += 1
-                      except: pass
-                  conn.execute("UPDATE domains SET tracker_expanded_at = datetime('now') WHERE domain = ?", (domain,))
-              conn.commit()
-              print(f"Added {added} domain-tracker links")
-              conn.close()
-              PY
-              REMOTE
+              root@147.93.113.37 "python3 /opt/cangraph/data/import_trackers.py /opt/cangraph/master_web_map.db /opt/cangraph/data/all_trackers.jsonl"; then
               echo "Push succeeded"
               break
             fi
