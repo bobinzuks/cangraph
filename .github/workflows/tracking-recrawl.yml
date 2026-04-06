@@ -1,0 +1,233 @@
+name: Tracking ID Re-crawl (FB Pixel, Shopify, Stripe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Domains per shard"
+        required: false
+        default: "5000"
+      workers:
+        description: "Concurrent workers per shard"
+        required: false
+        default: "32"
+  schedule:
+    - cron: "0 2 * * 6"  # Weekly Saturday 2am UTC
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    name: "Crawl shard ${{ matrix.shard }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Get domain shard from VPS
+        env:
+          VPS_PASS: ${{ secrets.VPS_PASS }}
+        run: |
+          sudo apt-get install -y sshpass
+          mkdir -p data
+
+          # Get domains that haven't been tracker-expanded yet
+          sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no root@147.93.113.37 \
+            "sqlite3 /opt/cangraph/master_web_map.db \"SELECT domain FROM domains WHERE fetched=1 AND (tracker_expanded_at IS NULL OR tracker_expanded_at = '') ORDER BY domain LIMIT ${{ github.event.inputs.batch_size || '5000' }} OFFSET $(( ${{ matrix.shard }} * ${{ github.event.inputs.batch_size || 5000 }} ));\"" \
+            > data/my_domains.txt
+
+          echo "Shard ${{ matrix.shard }}: $(wc -l < data/my_domains.txt) domains"
+
+      - name: Crawl for tracking IDs
+        run: |
+          python3 << 'PYSCRIPT'
+          import json, re, sys, time, random, os
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import requests
+
+          UA = [
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+              "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+          ]
+
+          PATTERNS = {
+              "fb_pixel":          re.compile(r"fbq\(['\"]init['\"],\s*['\"](\d+)['\"]"),
+              "fb_pixel_img":      re.compile(r"facebook\.com/tr\?id=(\d+)"),
+              "shopify_id":        re.compile(r"cdn\.shopify\.com/s/files/1/(\d{4}/\d{4})"),
+              "shopify_shop":      re.compile(r"Shopify\.shop\s*=\s*['\"]([^'\"]+)['\"]"),
+              "stripe_pk":         re.compile(r"(pk_(?:live|test)_[a-zA-Z0-9]{20,})"),
+              "mailchimp_list":    re.compile(r"list-manage\.com/.*?([a-f0-9]{10,32})"),
+              "hubspot_id":        re.compile(r"js\.hs-scripts\.com/(\d+)\.js"),
+              "intercom_app":      re.compile(r"app_id['\"\s:]+['\"]([a-z0-9]{6,})['\"]"),
+              "google_ads_aw":     re.compile(r"(AW-\d{6,})"),
+              "linkedin_insight":  re.compile(r"_linkedin_partner_id\s*=\s*['\"]?(\d+)"),
+              "tiktok_pixel":      re.compile(r"ttq\.load\(['\"]([A-Z0-9]{10,})['\"]"),
+              "hotjar_sid":        re.compile(r"hjid:\s*(\d{5,})"),
+              "plausible_domain":  re.compile(r'data-domain=["\']([^"\']+)["\']'),
+              "g4":                re.compile(r"(G-[A-Z0-9]{10,})"),
+              "gtm":               re.compile(r"(GTM-[A-Z0-9]{4,})"),
+              "ua":                re.compile(r"(UA-\d{4,}-\d{1,4})"),
+              "adsense":           re.compile(r"(ca-pub-\d{10,})"),
+              "google_ads":        re.compile(r"(AW-\d{8,}/[A-Za-z0-9_-]+)"),
+          }
+
+          domains_file = Path("data/my_domains.txt")
+          domains = [d.strip() for d in domains_file.read_text().splitlines() if d.strip()]
+          print(f"Processing {len(domains)} domains", flush=True)
+
+          results = []
+          errors = 0
+
+          def fetch_one(domain):
+              s = requests.Session()
+              s.headers["User-Agent"] = random.choice(UA)
+              found = {}
+              try:
+                  r = s.get(f"https://{domain}", timeout=10, allow_redirects=True)
+                  if r.status_code == 200:
+                      html = r.text[:40000]
+                      for ttype, regex in PATTERNS.items():
+                          for m in regex.finditer(html):
+                              found.setdefault(ttype, set()).add(m.group(1))
+              except:
+                  pass
+              return domain, {k: list(v) for k, v in found.items()}
+
+          workers = int(os.environ.get("WORKERS", "${{ github.event.inputs.workers || '32' }}"))
+          with ThreadPoolExecutor(max_workers=workers) as pool:
+              futs = {pool.submit(fetch_one, d): d for d in domains}
+              done = 0
+              for f in as_completed(futs):
+                  done += 1
+                  try:
+                      domain, ids = f.result()
+                      if ids:
+                          results.append({"domain": domain, "ids": ids})
+                  except:
+                      errors += 1
+                  if done % 500 == 0:
+                      print(f"  {done}/{len(domains)} done, {len(results)} with trackers", flush=True)
+
+          out = Path("data/trackers_${{ matrix.shard }}.jsonl")
+          with out.open("w") as fp:
+              for r in results:
+                  fp.write(json.dumps(r) + "\n")
+
+          print(f"\nDone: {len(domains)} domains, {len(results)} with trackers, {errors} errors")
+          PYSCRIPT
+        timeout-minutes: 100
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trackers-${{ matrix.shard }}
+          path: data/trackers_*.jsonl
+          retention-days: 30
+
+  merge:
+    name: Merge & import trackers
+    needs: crawl
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+          pattern: "trackers-*"
+          merge-multiple: true
+
+      - name: Merge and count
+        run: |
+          cat results/*.jsonl > data/all_trackers.jsonl 2>/dev/null || true
+          if [ -f data/all_trackers.jsonl ]; then
+            TOTAL=$(wc -l < data/all_trackers.jsonl)
+            echo "Total domains with trackers: $TOTAL"
+            python3 << 'PY'
+          import json
+          from collections import Counter
+          types = Counter()
+          with open("data/all_trackers.jsonl") as f:
+            for line in f:
+              r = json.loads(line)
+              for t in r.get("ids", {}):
+                types[t] += len(r["ids"][t])
+          print("\nTracker types found:")
+          for t, c in types.most_common(20):
+            print(f"  {t}: {c}")
+          PY
+          fi
+
+      - name: Push to VPS
+        env:
+          VPS_PASS: ${{ secrets.VPS_PASS }}
+        run: |
+          if [ ! -f data/all_trackers.jsonl ]; then exit 0; fi
+          sudo apt-get install -y sshpass
+          sshpass -p "$VPS_PASS" scp -o StrictHostKeyChecking=no \
+            data/all_trackers.jsonl root@147.93.113.37:/opt/cangraph/data/
+
+          sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no root@147.93.113.37 << 'REMOTE'
+          cd /opt/cangraph
+          python3 << 'PY'
+          import json, sqlite3
+          conn = sqlite3.connect("master_web_map.db")
+          conn.execute("PRAGMA journal_mode=WAL")
+          added = 0
+          with open("data/all_trackers.jsonl") as f:
+            for line in f:
+              r = json.loads(line)
+              domain = r["domain"]
+              for ttype, ids in r.get("ids", {}).items():
+                for tid in ids:
+                  full_id = f"{ttype}:{tid}"
+                  try:
+                    conn.execute("INSERT OR IGNORE INTO tracking_ids (type, id) VALUES (?, ?)", (ttype, full_id))
+                    row = conn.execute("SELECT id FROM tracking_ids WHERE type=? AND id=?", (ttype, full_id)).fetchone()
+                    if row:
+                      conn.execute("INSERT OR IGNORE INTO domain_ids (domain, tracking_id) VALUES (?, ?)", (domain, row[0]))
+                      added += 1
+                  except: pass
+              conn.execute("UPDATE domains SET tracker_expanded_at = datetime('now') WHERE domain = ?", (domain,))
+          conn.commit()
+          print(f"Added {added} domain-tracker links")
+          conn.close()
+          PY
+          REMOTE
+
+      - name: Log results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data/logs
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M")
+          if [ -f data/all_trackers.jsonl ]; then
+            TOTAL=$(wc -l < data/all_trackers.jsonl)
+            echo "{\"timestamp\":\"$TIMESTAMP\",\"domains_with_trackers\":$TOTAL}" > data/logs/trackers_${TIMESTAMP}.json
+            git add data/logs/
+            git diff --cached --quiet || git commit -m "trackers: re-crawled, $TOTAL domains with new IDs [$TIMESTAMP]"
+            git push || true
+          fi

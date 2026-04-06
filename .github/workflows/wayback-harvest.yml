@@ -1,0 +1,202 @@
+name: Wayback Machine Contact Harvester
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Domains per worker"
+        required: false
+        default: "200"
+      workers:
+        description: "Concurrent fetch workers"
+        required: false
+        default: "4"
+  schedule:
+    - cron: "0 4 * * *"  # Daily 4am UTC
+
+permissions:
+  contents: write
+
+jobs:
+  harvest:
+    name: "Wayback ${{ matrix.shard }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Download DB snapshot from VPS
+        env:
+          VPS_PASS: ${{ secrets.VPS_PASS }}
+        run: |
+          sudo apt-get install -y sshpass
+          mkdir -p data
+          # Get domain list from VPS
+          sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no root@147.93.113.37 \
+            "sqlite3 /opt/cangraph/canada_b2b.db \"SELECT domain FROM businesses WHERE domain IS NOT NULL AND domain != '' AND domain LIKE '%.ca' ORDER BY RANDOM() LIMIT 5000;\"" \
+            > data/domains_full.txt
+
+          # Split into shards
+          TOTAL=$(wc -l < data/domains_full.txt)
+          SHARD_SIZE=$(( (TOTAL + 9) / 10 ))
+          split -l $SHARD_SIZE -d -a 1 data/domains_full.txt data/shard_
+
+          # Pick our shard
+          SHARD_FILE="data/shard_${{ matrix.shard }}"
+          if [ -f "$SHARD_FILE" ]; then
+            mv "$SHARD_FILE" data/my_domains.txt
+            echo "Shard ${{ matrix.shard }}: $(wc -l < data/my_domains.txt) domains"
+          else
+            echo "No shard file for ${{ matrix.shard }}, creating empty"
+            touch data/my_domains.txt
+          fi
+
+      - name: Create mini DB with domains
+        run: |
+          python3 << 'PY'
+          import sqlite3
+          conn = sqlite3.connect("data/harvest.db")
+          conn.execute("""CREATE TABLE businesses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT, domain TEXT, email TEXT, phone TEXT,
+            confidence INTEGER DEFAULT 0
+          )""")
+          conn.execute("CREATE TABLE IF NOT EXISTS harvested_emails (id INTEGER PRIMARY KEY AUTOINCREMENT, business_id INTEGER, domain TEXT, email TEXT, phone TEXT, source_page TEXT, is_primary INTEGER DEFAULT 0, harvested_at TEXT)")
+          conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_he_de ON harvested_emails(domain, email)")
+          with open("data/my_domains.txt") as f:
+            for line in f:
+              d = line.strip()
+              if d:
+                conn.execute("INSERT INTO businesses (domain) VALUES (?)", (d,))
+          conn.commit()
+          print(f"Loaded {conn.execute('SELECT COUNT(*) FROM businesses').fetchone()[0]} domains")
+          conn.close()
+          PY
+
+      - name: Run Wayback harvester
+        env:
+          CANGRAPH_DIR: "."
+        run: |
+          python3 scripts/wayback_harvest.py \
+            --db data/harvest.db \
+            --limit ${{ github.event.inputs.limit || '200' }} \
+            --workers ${{ github.event.inputs.workers || '4' }} \
+            --rate 3 \
+            --max-snapshots 2
+        timeout-minutes: 50
+
+      - name: Export results
+        run: |
+          python3 << 'PY'
+          import sqlite3, json
+          conn = sqlite3.connect("data/harvest.db")
+          rows = conn.execute("SELECT domain, email, phone, harvested_at FROM harvested_emails").fetchall()
+          with open("data/results_${{ matrix.shard }}.jsonl", "w") as f:
+            for r in rows:
+              f.write(json.dumps({"domain": r[0], "email": r[1], "phone": r[2], "ts": r[3]}) + "\n")
+          print(f"Exported {len(rows)} contacts")
+          conn.close()
+          PY
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayback-${{ matrix.shard }}
+          path: data/results_*.jsonl
+          retention-days: 30
+
+  merge:
+    name: Merge & push to VPS
+    needs: harvest
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+          pattern: "wayback-*"
+          merge-multiple: true
+
+      - name: Merge results
+        run: |
+          cat results/*.jsonl > data/wayback_merged.jsonl 2>/dev/null || true
+          if [ -f data/wayback_merged.jsonl ]; then
+            TOTAL=$(wc -l < data/wayback_merged.jsonl)
+            EMAILS=$(grep -c '"email"' data/wayback_merged.jsonl || echo 0)
+            echo "Total contacts: $TOTAL"
+            echo "With emails: $EMAILS"
+          fi
+
+      - name: Push results to VPS
+        env:
+          VPS_PASS: ${{ secrets.VPS_PASS }}
+        run: |
+          if [ ! -f data/wayback_merged.jsonl ]; then
+            echo "No results to push"
+            exit 0
+          fi
+          sudo apt-get install -y sshpass
+          sshpass -p "$VPS_PASS" scp -o StrictHostKeyChecking=no \
+            data/wayback_merged.jsonl root@147.93.113.37:/opt/cangraph/data/
+
+          # Import into DB on VPS
+          sshpass -p "$VPS_PASS" ssh -o StrictHostKeyChecking=no root@147.93.113.37 << 'REMOTE'
+          cd /opt/cangraph
+          python3 << 'PY'
+          import json, sqlite3
+          conn = sqlite3.connect("canada_b2b.db")
+          conn.execute("PRAGMA journal_mode=WAL")
+          conn.execute("""CREATE TABLE IF NOT EXISTS wayback_contacts (
+            id INTEGER PRIMARY KEY, business_id INTEGER, domain TEXT,
+            email TEXT, phone TEXT, snapshot_url TEXT, snapshot_date TEXT,
+            extracted_at TEXT DEFAULT (datetime('now'))
+          )""")
+          count = 0
+          with open("data/wayback_merged.jsonl") as f:
+            for line in f:
+              r = json.loads(line)
+              try:
+                conn.execute("INSERT OR IGNORE INTO wayback_contacts (domain, email, phone, extracted_at) VALUES (?,?,?,?)",
+                  (r.get("domain"), r.get("email"), r.get("phone"), r.get("ts")))
+                count += 1
+              except: pass
+          conn.commit()
+          print(f"Imported {count} wayback contacts into canada_b2b.db")
+          conn.close()
+          PY
+          REMOTE
+
+      - name: Commit artifact log
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data/logs
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M")
+          if [ -f data/wayback_merged.jsonl ]; then
+            TOTAL=$(wc -l < data/wayback_merged.jsonl)
+            echo "{\"timestamp\":\"$TIMESTAMP\",\"contacts\":$TOTAL}" > data/logs/wayback_${TIMESTAMP}.json
+            git add data/logs/
+            git diff --cached --quiet || git commit -m "wayback: harvested $TOTAL contacts [$TIMESTAMP]"
+            git push || true
+          fi
